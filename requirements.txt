@@ -5,4 +5,4 @@ pypdf
 pillow
 requests
 python-docx
-flask
+flask==2.3.3

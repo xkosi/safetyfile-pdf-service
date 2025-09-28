@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+reportlab
+pypdf
+pillow
+requests

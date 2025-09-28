@@ -6,3 +6,4 @@ pillow
 requests
 python-docx
 flask==2.3.3
+gunicorn

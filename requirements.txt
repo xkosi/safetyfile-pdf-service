@@ -4,3 +4,4 @@ reportlab
 pypdf
 pillow
 requests
+python-docx

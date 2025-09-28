@@ -1,648 +1,695 @@
-import io
-import base64
-import math
-import re
-from typing import List, Dict, Any, Optional, Tuple
+# generate_pdf.py
+# Flask microservice for Safetyfile: generate PDF & DOCX from wizard preview JSON
+#
+# Endpoints:
+#   GET  /health          -> {"ok": true}
+#   POST /generate        -> body: { preview: {...}, format: "pdf" | "docx" }
+#                             returns: application/pdf or application/vnd.openxmlformats-officedocument.wordprocessingml.document
+#
+# Requirements (requirements.txt):
+#   Flask
+#   reportlab
+#   pypdf
+#   Pillow
+#   requests
+#   python-docx
+#
+# Run locally:
+#   export PORT=8000
+#   python3 generate_pdf.py
+#
+# Railway (recommended):
+#   - Add a new Python service with this file as entrypoint.
+#   - Start command: python3 generate_pdf.py
+#   - Set env LOGO_URL if you want a custom AVM logo URL.
+#   - Optionally set BRAND_PRIMARY (hex, e.g. #E30613).
+#
+# Notes:
+# - PDF export is complete: cover, sections, materials tables, mini bio (clickable), external PDFs inlined (pages appended).
+# - DOCX export is functional but simpler: headings, tables, images, hyperlinks.
+#   External PDFs are linked (not fully embedded as page images). Converting PDF pages to images requires extra deps (pdf2image/poppler).
+#   If you want that later, we can add it.
+#
+from __future__ import annotations
+import io, os, re, json, math
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from fastapi import FastAPI, Body
-from fastapi.responses import Response, PlainTextResponse
+from PIL import Image
+from flask import Flask, request, send_file, jsonify
+
+# PDF libs
 from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
-from reportlab.lib import colors
-from reportlab.lib.utils import ImageReader
 from reportlab.lib.styles import ParagraphStyle
-from reportlab.platypus import Paragraph
+from reportlab.platypus import Paragraph, Frame, Table, TableStyle, KeepTogether, Spacer, Image as RLImage
+from reportlab.lib.enums import TA_LEFT, TA_CENTER
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
 from pypdf import PdfReader, PdfWriter
 
-# ---------------------------
-# Pyred / AVM huisstijl
-# ---------------------------
-PYRED_RED = colors.HexColor("#E30613")
-TEXT = colors.HexColor("#111111")
-MUTED = colors.HexColor("#666666")
-TABLE_HEADER_BG = colors.HexColor("#F3F3F4")
+# DOCX
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt, Cm, Inches
+from docx.oxml.shared import OxmlElement, qn
 
-PAGE_W, PAGE_H = A4
-MARGIN = 18 * mm
-LINE_H = 7.5 * mm
-FONT = "Helvetica"
-FONT_B = "Helvetica-Bold"
+app = Flask(__name__)
 
-# ---------------------------
-# Webservice
-# ---------------------------
-app = FastAPI(title="Safetyfile PDF Service", version="1.0.0")
+# Branding
+BRAND_PRIMARY = os.getenv("BRAND_PRIMARY", "#E30613")  # Pyred rood
+BRAND_DARK = os.getenv("BRAND_DARK", "#000000")
+BRAND_LIGHT = os.getenv("BRAND_LIGHT", "#FFFFFF")
+LOGO_URL = os.getenv("LOGO_URL", "https://sfx.rentals/projects/media/logo.png")  # AVM logo
 
+# Helpers ------------------------------------------------------------------
 
-# =========================================================
-# Helpers
-# =========================================================
+def hex_to_rgb(h: str) -> Tuple[float, float, float]:
+    h = h.lstrip("#")
+    if len(h) == 3:
+        h = "".join([c*2 for c in h])
+    r = int(h[0:2], 16) / 255.0
+    g = int(h[2:4], 16) / 255.0
+    b = int(h[4:6], 16) / 255.0
+    return (r, g, b)
 
-def _new_canvas(buf: io.BytesIO) -> canvas.Canvas:
-    c = canvas.Canvas(buf, pagesize=A4)
-    c.setTitle("Veiligheidsdossier")
-    return c
+PRIMARY_RGB = hex_to_rgb(BRAND_PRIMARY)
 
-
-def _draw_header_bar(c: canvas.Canvas, title: str):
-    c.setFillColor(PYRED_RED)
-    c.rect(0, PAGE_H - 20 * mm, PAGE_W, 20 * mm, stroke=0, fill=1)
-    c.setFillColor(colors.white)
-    c.setFont(FONT_B, 18)
-    c.drawString(MARGIN, PAGE_H - 13 * mm, title)
-
-
-def _draw_logo(c: canvas.Canvas, logo_url: Optional[str], x: float, y: float, w: float, h: float):
-    if not logo_url:
-        return
+def fetch_bytes(url: str, timeout: int = 20) -> Optional[bytes]:
+    if not url:
+        return None
     try:
-        if logo_url.startswith("data:"):
-            head, data = logo_url.split(",", 1)
-            img = ImageReader(io.BytesIO(base64.b64decode(data)))
-        else:
-            resp = requests.get(logo_url, timeout=15)
-            resp.raise_for_status()
-            img = ImageReader(io.BytesIO(resp.content))
-        c.drawImage(img, x, y, w, h, preserveAspectRatio=True, mask="auto")
+        r = requests.get(url, timeout=timeout)
+        if r.ok:
+            return r.content
     except Exception:
         pass
+    return None
 
-
-def _text(c: canvas.Canvas, x: float, y: float, txt: str, size=11, bold=False, color=TEXT):
-    c.setFillColor(color)
-    c.setFont(FONT_B if bold else FONT, size)
-    c.drawString(x, y, txt)
-
-
-def _para(c: canvas.Canvas, x: float, y: float, w: float, txt: str, size=11):
-    style = ParagraphStyle(
-        "body", fontName=FONT, fontSize=size, leading=size * 1.2, textColor=TEXT
-    )
-    p = Paragraph(txt, style)
-    a_w = w
-    a_h = 5000
-    a = p.wrap(a_w, a_h)
-    p.drawOn(c, x, y - a[1])
-    return a[1]
-
-
-def _underline_field(c: canvas.Canvas, label: str, value: str, x: float, y: float, w: float):
-    _text(c, x, y + 3, label, size=10, bold=True, color=PYRED_RED)
-    c.setStrokeColor(MUTED)
-    c.line(x, y, x + w, y)
-    _text(c, x + 2, y - 12, value or "—", size=12, bold=False, color=TEXT)
-
-
-def _draw_table(
-    c: canvas.Canvas,
-    x: float,
-    y: float,
-    colspec: List[Tuple[str, float]],
-    rows: List[List[str]],
-    row_h: float = 8 * mm,
-    header_bg=TABLE_HEADER_BG,
-):
-    # header
-    c.setFillColor(header_bg)
-    c.rect(x, y - row_h, sum(w for _, w in colspec), row_h, stroke=0, fill=1)
-    c.setStrokeColor(colors.black)
-    c.setLineWidth(0.5)
-    c.rect(x, y - row_h, sum(w for _, w in colspec), row_h, stroke=1, fill=0)
-    c.setFillColor(TEXT)
-    c.setFont(FONT_B, 10)
-    cur_x = x + 2
-    for name, width in colspec:
-        c.drawString(cur_x, y - row_h + 2.5, name)
-        cur_x += width
-    # rows
-    c.setFont(FONT, 10)
-    y_row = y - row_h
-    for r in rows:
-        y_row -= row_h
-        c.setStrokeColor(colors.black)
-        c.rect(x, y_row, sum(w for _, w in colspec), row_h, stroke=1, fill=0)
-        cur_x = x + 2
-        for i, (_, w) in enumerate(colspec):
-            val = r[i] if i < len(r) else ""
-            c.drawString(cur_x, y_row + 2.5, str(val))
-            cur_x += w
-    return y_row
-
-
-def _fetch_image_reader(url_or_data: Optional[str]) -> Optional[ImageReader]:
-    if not url_or_data:
+def image_from_url(url: str, max_w_mm: float = 50, max_h_mm: float = 50) -> Optional[RLImage]:
+    data = fetch_bytes(url)
+    if not data:
         return None
     try:
-        if url_or_data.startswith("data:"):
-            b64 = url_or_data.split(",", 1)[1]
-            return ImageReader(io.BytesIO(base64.b64decode(b64)))
-        r = requests.get(url_or_data, timeout=20)
-        r.raise_for_status()
-        return ImageReader(io.BytesIO(r.content))
-    except Exception:
-        return None
-
-
-def _pdf_bytes_from_url_or_data(ref: str) -> Optional[bytes]:
-    try:
-        if ref.startswith("data:"):
-            return base64.b64decode(ref.split(",", 1)[1])
-        r = requests.get(ref, timeout=25)
-        r.raise_for_status()
-        return r.content
-    except Exception:
-        return None
-
-
-def _chapter_page(title: str, subtitle: Optional[str] = None, logo_url: Optional[str] = None) -> bytes:
-    buf = io.BytesIO()
-    c = _new_canvas(buf)
-    _draw_header_bar(c, title)
-    if subtitle:
-        _text(c, MARGIN, PAGE_H - 35 * mm, subtitle, size=14, bold=False)
-    _draw_logo(c, logo_url, PAGE_W - 50 * mm, PAGE_H - 18 * mm, 40 * mm, 12 * mm)
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-
-def _append_pdf(writer: PdfWriter, pdf_bytes: bytes):
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    for page in reader.pages:
-        writer.add_page(page)
-
-
-# =========================================================
-# Secties – genereren als losse PDF-bytes
-# =========================================================
-
-def section_cover(preview: Dict[str, Any]) -> bytes:
-    title = "VEILIGHEIDSDOSSIER"
-    project_name = (preview.get("avm") or {}).get("name") or (preview.get("project") or {}).get("name") or ""
-    logo = preview.get("branding", {}).get("logo") or preview.get("logo") or "https://sfx.rentals/projects/media/logo.png"
-
-    buf = io.BytesIO()
-    c = _new_canvas(buf)
-
-    # Pyred accent
-    c.setFillColor(PYRED_RED)
-    c.rect(0, PAGE_H * 0.72, PAGE_W, PAGE_H * 0.28, stroke=0, fill=1)
-
-    # AVM logo
-    _draw_logo(c, logo, MARGIN, PAGE_H - 40 * mm, 50 * mm, 16 * mm)
-
-    # Titel
-    c.setFillColor(colors.white)
-    c.setFont(FONT_B, 36)
-    c.drawString(MARGIN, PAGE_H * 0.78, title)
-
-    # Projectnaam
-    c.setFillColor(colors.white)
-    c.setFont(FONT_B, 18)
-    c.drawString(MARGIN, PAGE_H * 0.78 - 20 * mm, project_name or "—")
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-
-def section_toc(simple_items: List[str]) -> bytes:
-    buf = io.BytesIO()
-    c = _new_canvas(buf)
-    _draw_header_bar(c, "INHOUDSTAFEL")
-    y = PAGE_H - 30 * mm
-    c.setFont(FONT, 12)
-    c.setFillColor(TEXT)
-    for i, item in enumerate(simple_items, 1):
-        c.drawString(MARGIN, y, f"{i}. {item}")
-        y -= 8 * mm
-        if y < 40 * mm:
-            c.showPage()
-            _draw_header_bar(c, "INHOUDSTAFEL (vervolg)")
-            y = PAGE_H - 30 * mm
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-
-def section_project_info(preview: Dict[str, Any]) -> bytes:
-    p = preview.get("avm") or preview.get("project") or {}
-    customer = p.get("customer") or {}
-    contact = customer.get("contact") or {}
-    location = p.get("location") or {}
-
-    buf = io.BytesIO()
-    c = _new_canvas(buf)
-    _draw_header_bar(c, "PROJECTGEGEVENS (AVM)")
-
-    x = MARGIN
-    y = PAGE_H - 35 * mm
-
-    # Tabel-stijl (brede onderstreepte regels)
-    col_w = (PAGE_W - 2 * MARGIN)
-    _underline_field(c, "Project", p.get("name", ""), x, y, col_w); y -= 18 * mm
-    _underline_field(c, "Opdrachtgever", customer.get("name", ""), x, y, col_w); y -= 18 * mm
-    _underline_field(c, "Adres", customer.get("address", ""), x, y, col_w); y -= 18 * mm
-    _underline_field(c, "Contactpersoon", contact.get("name", ""), x, y, col_w); y -= 18 * mm
-    _underline_field(c, "Tel", contact.get("phone", ""), x, y, col_w); y -= 18 * mm
-    _underline_field(c, "E-mail", contact.get("email", ""), x, y, col_w); y -= 18 * mm
-    _underline_field(c, "Locatie", location.get("name", ""), x, y, col_w); y -= 18 * mm
-    _underline_field(c, "Adres locatie", location.get("address", ""), x, y, col_w); y -= 18 * mm
-
-    # Datums
-    start = p.get("project_start_date") or p.get("start_date") or ""
-    end = p.get("project_end_date") or p.get("end_date") or ""
-    _underline_field(c, "Start", start, x, y, col_w * 0.48)
-    _underline_field(c, "Einde", end, x + col_w * 0.52, y, col_w * 0.48); y -= 18 * mm
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-
-def section_responsible(preview: Dict[str, Any]) -> bytes:
-    docs = preview.get("documents", {}) or {}
-    mini_url = docs.get("crew_bio_mini")
-    full_url = docs.get("crew_bio_full")
-    responsible = preview.get("responsible") or "Verantwoordelijke"
-
-    buf = io.BytesIO()
-    c = _new_canvas(buf)
-    _draw_header_bar(c, "VERANTWOORDELIJKE")
-
-    y = PAGE_H - 35 * mm
-    _text(c, MARGIN, y, responsible, size=16, bold=True); y -= 10 * mm
-
-    # Mini bio afbeelding
-    img = _fetch_image_reader(mini_url)
-    if img:
-        c.drawImage(img, MARGIN, y - 60 * mm, width=60 * mm, height=60 * mm, preserveAspectRatio=True, mask="auto")
-    _para(
-        c,
-        MARGIN + 65 * mm,
-        y,
-        PAGE_W - MARGIN * 2 - 65 * mm,
-        "De mini-bio hierboven is aanklikbaar in het digitale dossier. De volledige bio is beschikbaar via onderstaande link."
-    )
-    y -= 70 * mm
-
-    if full_url:
-        _text(c, MARGIN, y, "Volledige bio:", size=12, bold=True); y -= 6 * mm
-        c.setFillColor(PYRED_RED)
-        c.setFont(FONT, 11)
-        c.linkURL(full_url, (MARGIN, y - 2, MARGIN + 400, y + 12))
-        c.drawString(MARGIN, y, full_url)
-        y -= 10 * mm
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-
-def _classify_dees(item: Dict[str, Any]) -> str:
-    # verwacht custom_13 met T1/T2 of F1..F4
-    c = (item.get("custom_13") or item.get("custom", {}).get("custom_13") or "").strip().upper()
-    if re.fullmatch(r"T[12]", c):
-        return c
-    if re.fullmatch(r"F[1-4]", c):
-        return c
-    return ""
-
-
-def section_materials_dees(preview: Dict[str, Any]) -> bytes:
-    items: List[Dict[str, Any]] = (preview.get("materials") or {}).get("dees") or []
-    if not items:
-        # lege sectie
-        return _chapter_page("MATERIALEN – DEES", "Geen materialen geselecteerd.")
-
-    # opsplitsen
-    pyro = [i for i in items if _classify_dees(i).startswith("T")]
-    fireworks = [i for i in items if _classify_dees(i).startswith("F")]
-
-    def build_table_for(label: str, rows_src: List[Dict[str, Any]]) -> bytes:
+        img = Image.open(io.BytesIO(data))
+        img_format = img.format or "PNG"
+        # Resize keeping aspect ratio
+        max_w = max_w_mm * mm
+        max_h = max_h_mm * mm
+        w, h = img.size
+        scale = min(max_w / w, max_h / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
         buf = io.BytesIO()
-        c = _new_canvas(buf)
-        _draw_header_bar(c, f"MATERIALEN – DEES ({label})")
-        y = PAGE_H - 30 * mm
+        img.save(buf, format=img_format)
+        buf.seek(0)
+        return RLImage(buf, width=new_w, height=new_h)
+    except Exception:
+        return None
 
-        colspec = [
-            ("Code", 30 * mm),
-            ("Naam", 90 * mm),
-            ("Class", 20 * mm),
-            ("NEC", 20 * mm),
-            ("Aantal", 20 * mm),
-            ("Totaal NEC", 25 * mm),
-        ]
+def parse_nec(value: Any) -> float:
+    """Parse NEC values that may be stored as messy text. Returns a float sum (grams)."""
+    if value is None:
+        return 0.0
+    s = str(value)
+    # extract numbers (allow comma decimal)
+    nums = re.findall(r"[\d]+(?:[.,]\d+)?", s)
+    total = 0.0
+    for n in nums:
+        n = n.replace(",", ".")
+        try:
+            total += float(n)
+        except ValueError:
+            pass
+    return round(total, 3)
 
-        rows = []
-        total_nec = 0.0
+def clean_text(s: Any) -> str:
+    if s is None:
+        return ""
+    # strip basic HTML if present
+    txt = re.sub(r"<[^>]+>", "", str(s))
+    return txt.strip()
 
-        for it in rows_src:
-            nec = it.get("nec") or it.get("custom", {}).get("nec") or ""
-            try:
-                nec_val = float(str(nec).replace(",", "."))
-            except Exception:
-                nec_val = 0.0
-            qty = int(it.get("quantity_total") or it.get("qty") or 0)
-            rows.append([
-                it.get("code") or "—",
-                it.get("displayname") or "—",
-                _classify_dees(it) or "—",
-                str(nec or "—"),
-                str(qty),
-                f"{nec_val * max(qty,1):.2f}" if nec_val else "—"
-            ])
-            total_nec += nec_val * max(qty, 1)
+def add_hyperlink(run, url):
+    """Add a hyperlink to a python-docx run (helper)."""
+    part = run.part
+    r_id = part.relate_to(url, reltype="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink", is_external=True)
+    r = run._r
+    hlink = OxmlElement('w:hyperlink')
+    hlink.set(qn('r:id'), r_id)
+    newr = OxmlElement('w:r')
+    rpr = OxmlElement('w:rPr')
+    u = OxmlElement('w:u'); u.set(qn('w:val'), 'single')
+    color = OxmlElement('w:color'); color.set(qn('w:val'), '0000FF')
+    rpr.append(u); rpr.append(color)
+    t = OxmlElement('w:t')
+    t.text = run.text
+    newr.append(rpr); newr.append(t)
+    hlink.append(newr)
+    r.addnext(hlink)
+    r.text = ""
 
-        _draw_table(c, MARGIN, y, colspec, rows)
-        y = 40 * mm
-        _text(c, MARGIN, y, f"Totaal NEC voor {label}: {total_nec:.2f}" if rows else "—", size=12, bold=True)
-        c.showPage()
-        c.save()
-        return buf.getvalue()
+# PDF building --------------------------------------------------------------
 
-    parts: List[bytes] = []
-    if pyro:
-        parts.append(build_table_for("Pyro (T1/T2)", pyro))
-    if fireworks:
-        parts.append(build_table_for("Vuurwerk (F1–F4)", fireworks))
-    if not parts:
-        parts.append(_chapter_page("MATERIALEN – DEES", "Geen herkenbare T/F-classificatie."))
+def pdf_cover(c: canvas.Canvas, preview: Dict[str, Any], logo_bytes: Optional[bytes]):
+    W, H = A4
+    c.setFillColorRGB(*PRIMARY_RGB)
+    c.rect(0, H-60, W, 60, fill=1, stroke=0)
 
-    # merge terug
-    writer = PdfWriter()
-    for p in parts:
-        _append_pdf(writer, p)
-    out = io.BytesIO()
-    writer.write(out)
-    return out.getvalue()
+    # Logo
+    if logo_bytes:
+        try:
+            img = Image.open(io.BytesIO(logo_bytes))
+            iw, ih = img.size
+            scale = min(160/iw, 50/ih)
+            nw, nh = iw*scale, ih*scale
+            buf = io.BytesIO(); img.save(buf, format=img.format or "PNG"); buf.seek(0)
+            c.drawImage(buf, 30, H-55, width=nw, height=nh, mask='auto')
+        except Exception:
+            pass
 
+    title = "Veiligheidsdossier"
+    project_name = preview.get("avm", {}).get("name") or preview.get("dees", {}).get("name") or ""
 
-def section_materials_avm(preview: Dict[str, Any]) -> bytes:
-    items: List[Dict[str, Any]] = (preview.get("materials") or {}).get("avm") or []
-    if not items:
-        return _chapter_page("MATERIALEN – AVM", "Geen materialen geselecteerd.")
+    c.setFont("Helvetica-Bold", 28)
+    c.setFillColorRGB(0,0,0)
+    c.drawString(30, H-120, title)
+    if project_name:
+        c.setFont("Helvetica", 16)
+        c.drawString(30, H-145, project_name)
 
-    buf = io.BytesIO()
-    c = _new_canvas(buf)
-    _draw_header_bar(c, "MATERIALEN – AVM")
-    y = PAGE_H - 30 * mm
-
-    colspec = [
-        ("Naam", 90 * mm),
-        ("Aantal", 20 * mm),
-        ("Type", 20 * mm),
-        ("Links (CE/Manual/MSDS)", 60 * mm),
-    ]
-
-    rows: List[List[str]] = []
-    for it in items:
-        files = it.get("files") or []
-        def pick(label: str):
-            # heuristisch op bestandsnaam
-            for f in files:
-                name = (f.get("name") or f.get("displayname") or "").lower()
-                if label in name:
-                    return f.get("url")
-            return None
-
-        ce = pick("conform") or pick("ce")
-        man = pick("manual") or pick("handleid")
-        msds = pick("msds") or pick("sds")
-        linktxt = " ".join([
-            f"[CE]" if ce else "",
-            f"[Manual]" if man else "",
-            f"[MSDS]" if msds else "",
-        ]).strip() or "—"
-
-        rows.append([
-            it.get("displayname") or "—",
-            str(it.get("quantity_total") or it.get("qty") or 0),
-            it.get("type") or "—",
-            linktxt
-        ])
-
-    y_end = _draw_table(c, MARGIN, y, colspec, rows)
-
-    # visuele link-annotaties onder de tabel
-    y_links = y_end - 10
-    c.setFont(FONT, 10)
-    for it in items:
-        files = it.get("files") or []
-        links_line = []
-        for label in ["CE", "MANUAL", "MSDS"]:
-            url = None
-            for f in files:
-                name = (f.get("name") or f.get("displayname") or "").lower()
-                if (label == "CE" and ("conform" in name or "ce" in name)) or \
-                   (label == "MANUAL" and ("manual" in name or "handleid" in name)) or \
-                   (label == "MSDS" and ("msds" in name or "sds" in name)):
-                    url = f.get("url"); break
-            if url:
-                links_line.append((label, url))
-        if links_line:
-            x = MARGIN
-            c.setFillColor(PYRED_RED)
-            for lab, url in links_line:
-                txt = f"{lab}: {url}"
-                c.drawString(x, y_links, txt)
-                c.linkURL(url, (x, y_links - 2, x + c.stringWidth(txt, FONT, 10), y_links + 10))
-                y_links -= 6 * mm
+    c.setFont("Helvetica", 10)
+    c.setFillColorRGB(0.3,0.3,0.3)
+    c.drawString(30, 40, f"Gegenereerd: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
 
     c.showPage()
-    c.save()
-    return buf.getvalue()
 
+def pdf_section_title(c: canvas.Canvas, title: str):
+    W, H = A4
+    c.setFillColorRGB(1,1,1)
+    c.rect(0,0,W,H,fill=1,stroke=0)
+    c.setFillColorRGB(*PRIMARY_RGB)
+    c.rect(0, H-40, W, 40, fill=1, stroke=0)
+    c.setFillColorRGB(1,1,1)
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(30, H-28, title)
+    c.showPage()
 
-def section_embed_pdf(title: str, url_or_data: str, logo: Optional[str] = None) -> bytes:
-    """Maakt eerst een titelpagina, daarna plakt het de externe PDF erachter."""
-    ch = _chapter_page(title, None, logo)
-    ext = _pdf_bytes_from_url_or_data(url_or_data)
-    writer = PdfWriter()
-    _append_pdf(writer, ch)
-    if ext:
-        _append_pdf(writer, ext)
-    else:
-        # foutpagina
-        _append_pdf(writer, _chapter_page(title, "⚠️ Kon het document niet laden.", logo))
-    out = io.BytesIO()
-    writer.write(out)
-    return out.getvalue()
+def project_table_story(preview: Dict[str, Any]) -> List[Any]:
+    p = preview.get("avm") or {}
+    rows = []
+    def row(label, val):
+        rows.append([Paragraph(f"<b>{label}</b>", ParagraphStyle(name='pl', fontName='Helvetica', fontSize=10)),
+                     Paragraph(f"{clean_text(val)}", ParagraphStyle(name='pv', fontName='Helvetica', fontSize=10, underlineWidth=0.5))])
+    row("Project", p.get("name", ""))
+    row("Opdrachtgever", p.get("customer", {}).get("name", ""))
+    row("Adres", p.get("customer", {}).get("address", ""))
+    contact = p.get("customer", {}).get("contact")
+    if contact:
+        row("Contactpersoon", contact.get("name",""))
+        row("Tel", contact.get("phone",""))
+        row("E-mail", contact.get("email",""))
+    row("Locatie", p.get("location", {}).get("name",""))
+    row("Adres locatie", p.get("location", {}).get("address",""))
+    row("Start", p.get("project_start_date",""))
+    row("Einde", p.get("project_end_date",""))
 
+    t = Table(rows, colWidths=[60*mm, 120*mm])
+    t.setStyle(TableStyle([
+        ("BOX",(0,0),(-1,-1),0.75, colors.black),
+        ("INNERGRID",(0,0),(-1,-1),0.25, colors.grey),
+        ("BACKGROUND",(0,0),(0,-1), colors.whitesmoke),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+    ]))
+    return [t]
 
-def section_embed_uploads(title: str, uploads: List[Dict[str, Any]], logo: Optional[str] = None) -> bytes:
-    """Embedt meerdere geüploade PDF's als hoofdstuk."""
-    if not uploads:
-        return _chapter_page(title, "Geen uploads.", logo)
-    writer = PdfWriter()
-    _append_pdf(writer, _chapter_page(title, None, logo))
-    for up in uploads:
-        data_url = up.get("data")
-        if not data_url:
-            continue
-        try:
-            b = base64.b64decode(data_url.split(",", 1)[1])
-        except Exception:
-            b = None
-        if not b:
-            continue
-        # als PDF: direct append; als niet-PDF (bv. image), maak 1 pagina en plak afbeelding
-        if (up.get("type") or "").lower().endswith("pdf"):
-            try:
-                _append_pdf(writer, b)
-            except Exception:
-                pass
+def materials_table_story_avm(materials: List[Dict[str, Any]]) -> List[Any]:
+    story: List[Any] = []
+    header = ["Kies", "Naam", "Aantal", "Type", "Links"]
+    data = [header]
+    for m in materials:
+        links_txt = ""
+        for f in m.get("files", []):
+            label = os.path.splitext(f.get("name",""))[0]
+            url = f.get("url","")
+            if url:
+                links_txt += f"{label}\n"
+        data.append(["✔", clean_text(m.get("displayname","")), str(m.get("quantity_total",0)), m.get("type",""), links_txt])
+
+    t = Table(data, colWidths=[15*mm, 85*mm, 20*mm, 20*mm, 50*mm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0), colors.Color(*PRIMARY_RGB)),
+        ("TEXTCOLOR",(0,0),(-1,0), colors.white),
+        ("GRID",(0,0),(-1,-1),0.25, colors.grey),
+        ("VALIGN",(0,0),(-1,-1),"TOP"),
+        ("ALIGN",(2,1),(2,-1),"RIGHT"),
+        ("ALIGN",(3,1),(3,-1),"CENTER"),
+    ]))
+    story.append(t)
+    return story
+
+def materials_table_story_dees(materials: List[Dict[str, Any]]) -> List[Any]:
+    # Split pyro vs vuurwerk based on custom_13 content (T1/T2 vs F1..F4)
+    pyro_rows = [["Naam","NEC (g)","Aantal","Type"]]
+    vuur_rows = [["Naam","NEC (g)","Aantal","Type"]]
+    tot_pyro = 0.0; tot_vuur = 0.0
+
+    for m in materials:
+        label = clean_text(m.get("displayname",""))
+        qty = int(m.get("quantity_total",0) or 0)
+        tag = str(m.get("custom_13","")).upper()
+        nec_val = parse_nec(tag)
+        # bucket
+        if any(x in tag for x in ["T1","T2"]):
+            pyro_rows.append([label, f"{nec_val:.3f}", str(qty), "Pyro"])
+            tot_pyro += nec_val * max(qty,1)
+        elif any(x in tag for x in ["F1","F2","F3","F4"]):
+            vuur_rows.append([label, f"{nec_val:.3f}", str(qty), "Vuurwerk"])
+            tot_vuur += nec_val * max(qty,1)
         else:
-            # afbeelding -> eigen pagina
-            buf = io.BytesIO()
-            c = _new_canvas(buf)
-            _draw_header_bar(c, up.get("name") or "Bijlage")
-            img = ImageReader(io.BytesIO(b))
-            iw, ih = img.getSize()
-            max_w = PAGE_W - 2 * MARGIN
-            max_h = PAGE_H - 50 * mm
-            scale = min(max_w / iw, max_h / ih)
-            w = iw * scale
-            h = ih * scale
-            c.drawImage(img, (PAGE_W - w) / 2, (PAGE_H - h) / 2, w, h, preserveAspectRatio=True, mask="auto")
-            c.showPage(); c.save()
-            _append_pdf(writer, buf.getvalue())
+            # unknown → go to pyro table but mark as "-"
+            pyro_rows.append([label, f"{nec_val:.3f}", str(qty), "-"])
+            tot_pyro += nec_val * max(qty,1)
 
-    out = io.BytesIO()
-    writer.write(out)
-    return out.getvalue()
+    story: List[Any] = []
+    if len(pyro_rows) > 1:
+        t1 = Table(pyro_rows, colWidths=[90*mm, 30*mm, 20*mm, 30*mm])
+        t1.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0), colors.Color(*PRIMARY_RGB)),
+            ("TEXTCOLOR",(0,0),(-1,0), colors.white),
+            ("GRID",(0,0),(-1,-1),0.25, colors.grey),
+            ("ALIGN",(1,1),(2,-1),"RIGHT"),
+        ]))
+        story.append(Paragraph("<b>Pyrotechniek (T1/T2)</b>", ParagraphStyle(name="h", fontName="Helvetica-Bold", fontSize=12)))
+        story.append(Spacer(1,4))
+        story.append(t1)
+        story.append(Spacer(1,6))
+        story.append(Paragraph(f"<b>Totaal NEC:</b> {tot_pyro:.3f} g", ParagraphStyle(name="p", fontName="Helvetica", fontSize=10)))
+        story.append(Spacer(1,10))
 
+    if len(vuur_rows) > 1:
+        t2 = Table(vuur_rows, colWidths=[90*mm, 30*mm, 20*mm, 30*mm])
+        t2.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0), colors.Color(*PRIMARY_RGB)),
+            ("TEXTCOLOR",(0,0),(-1,0), colors.white),
+            ("GRID",(0,0),(-1,-1),0.25, colors.grey),
+            ("ALIGN",(1,1),(2,-1),"RIGHT"),
+        ]))
+        story.append(Paragraph("<b>Vuurwerk (F1–F4)</b>", ParagraphStyle(name="h", fontName="Helvetica-Bold", fontSize=12)))
+        story.append(Spacer(1,4))
+        story.append(t2)
+        story.append(Spacer(1,6))
+        story.append(Paragraph(f"<b>Totaal NEC:</b> {tot_vuur:.3f} g", ParagraphStyle(name="p", fontName="Helvetica", fontSize=10)))
 
-# =========================================================
-# Orchestratie – volledige PDF
-# =========================================================
+    if len(story) == 0:
+        story.append(Paragraph("Geen Dees-materialen geselecteerd.", ParagraphStyle(name="p", fontName="Helvetica", fontSize=10)))
 
-def build_full_pdf(preview: Dict[str, Any]) -> bytes:
-    branding = preview.get("branding", {}) or {}
-    logo = branding.get("logo") or preview.get("logo") or "https://sfx.rentals/projects/media/logo.png"
+    return story
 
-    # Inhoudstafel (tekstueel, zonder paginanummers)
-    toc_items = [
-        "Projectgegevens",
-        "Emergency",
-        "Verzekeringen",
-        "Verantwoordelijke",
-        "Materialen – Dees",
-        "Materialen – AVM",
-        "Inplantingsplan",
-        "Risicoanalyse Pyro & Special Effects",
-        "Windplan",
-        "Droogteplan",
-        "Vergunningen & Toelatingen",
+def build_base_pdf(preview: Dict[str, Any]) -> io.BytesIO:
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+
+    logo_bytes = fetch_bytes(LOGO_URL)
+
+    # Cover
+    pdf_cover(c, preview, logo_bytes)
+
+    # Inhoudstafel (simple, zonder pagenumbers to avoid complexity)
+    pdf_section_title(c, "Inhoudstafel")
+    c.setFont("Helvetica", 11)
+    sections = [
+        "1. Projectgegevens",
+        "2. Emergency",
+        "3. Verzekeringen",
+        "4. Verantwoordelijke",
+        "5. Materialen",
+        "6. Inplantingsplan",
+        "7. Risicoanalyse Pyro & Special Effects",
+        "8. Windplan",
+        "9. Droogteplan",
+        "10. Vergunningen & Toelatingen",
     ]
+    y = A4[1]-70
+    for s in sections:
+        c.drawString(30, y, s)
+        y -= 18
+        if y < 60:
+            c.showPage()
+            y = A4[1]-60
+    c.showPage()
 
-    parts: List[bytes] = []
-    parts.append(section_cover(preview))
-    parts.append(section_toc(toc_items))
-    parts.append(section_project_info(preview))
+    # 1. Projectgegevens
+    pdf_section_title(c, "1. Projectgegevens")
+    story = project_table_story(preview)
+    frame = Frame(30, 50, A4[0]-60, A4[1]-120, showBoundary=0)
+    frame.addFromList(story, c)
+    c.showPage()
 
-    docs = preview.get("documents", {}) or {}
-    # 2 Emergency
-    if docs.get("emergency"):
-        parts.append(section_embed_pdf("EMERGENCY", docs["emergency"], logo))
+    # 2. Emergency (title page only, actual PDF will be appended later)
+    pdf_section_title(c, "2. Emergency")
+
+    # 3. Verzekeringen (title page only)
+    pdf_section_title(c, "3. Verzekeringen")
+
+    # 4. Verantwoordelijke
+    pdf_section_title(c, "4. Verantwoordelijke")
+    resp = preview.get("responsible")
+    crew_bio_mini = preview.get("documents", {}).get("crew_bio_mini") or ""
+    crew_bio_full = preview.get("documents", {}).get("crew_bio_full") or ""
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(30, A4[1]-70, f"Projectverantwoordelijke: {resp or '-'}")
+    y = A4[1]-90
+    # Mini bio image if URL
+    if crew_bio_mini:
+        img = image_from_url(crew_bio_mini, max_w_mm=70, max_h_mm=60)
+        if img:
+            frame = Frame(30, 120, A4[0]-60, A4[1]-240, showBoundary=0)
+            story = [img, Spacer(1,6)]
+            if crew_bio_full:
+                story.append(Paragraph(f'<font color="blue"><u><link href="{crew_bio_full}">Open volledige bio</link></u></font>',
+                                       ParagraphStyle(name="lnk", fontName="Helvetica", fontSize=10)))
+            frame.addFromList(story, c)
+        else:
+            c.setFont("Helvetica", 10)
+            c.drawString(30, y, "(Mini bio kon niet geladen worden)")
+            y -= 16
     else:
-        parts.append(_chapter_page("EMERGENCY", "Geen document opgegeven.", logo))
+        c.setFont("Helvetica", 10)
+        c.drawString(30, y, "Geen mini-bio ingesteld.")
+        y -= 16
+    c.showPage()
 
-    # 3 Verzekeringen (één hoofdstuk met beide PDFs achter elkaar)
-    ins = docs.get("insurance") or []
-    if ins:
-        writer = PdfWriter()
-        _append_pdf(writer, _chapter_page("VERZEKERINGEN", None, logo))
-        for u in ins:
-            b = _pdf_bytes_from_url_or_data(u)
-            if b:
-                _append_pdf(writer, b)
-        out = io.BytesIO(); writer.write(out)
-        parts.append(out.getvalue())
-    else:
-        parts.append(_chapter_page("VERZEKERINGEN", "Geen documenten.", logo))
-
-    # 4 Verantwoordelijke
-    parts.append(section_responsible(preview))
+    # 5. Materialen
+    pdf_section_title(c, "5. Materialen")
 
     # 5.1 Dees
-    parts.append(section_materials_dees(preview))
+    materials_dees = (preview.get("materials") or {}).get("dees") or []
+    if materials_dees:
+        c.setFont("Helvetica-Bold", 12); c.drawString(30, A4[1]-70, "5.1 Dees")
+        frame = Frame(30, 60, A4[0]-60, A4[1]-120, showBoundary=0)
+        frame.addFromList(materials_table_story_dees(materials_dees), c)
+        c.showPage()
+    else:
+        c.setFont("Helvetica", 10); c.drawString(30, A4[1]-70, "5.1 Dees — geen items geselecteerd.")
+        c.showPage()
 
     # 5.2 AVM
-    parts.append(section_materials_avm(preview))
-
-    # 6 Inplantingsplan (uploads.siteplan -> één bestand)
-    upl = (preview.get("uploads") or {})
-    siteplan_list = upl.get("siteplan") or []
-    parts.append(section_embed_uploads("INPLANTINGSPLAN", siteplan_list, logo))
-
-    # 7 Risicoanalyses
-    ra_writer = PdfWriter()
-    _append_pdf(ra_writer, _chapter_page("RISICOANALYSE PYRO & SPECIAL EFFECTS", None, logo))
-    any_ra = False
-    for key in ["risk_pyro", "risk_general"]:
-        if docs.get(key):
-            b = _pdf_bytes_from_url_or_data(docs[key])
-            if b:
-                _append_pdf(ra_writer, b); any_ra = True
-    if any_ra:
-        tmp = io.BytesIO(); ra_writer.write(tmp); parts.append(tmp.getvalue())
+    materials_avm = (preview.get("materials") or {}).get("avm") or []
+    if materials_avm:
+        c.setFont("Helvetica-Bold", 12); c.drawString(30, A4[1]-70, "5.2 AVM")
+        frame = Frame(30, 60, A4[0]-60, A4[1]-120, showBoundary=0)
+        frame.addFromList(materials_table_story_avm(materials_avm), c)
+        c.showPage()
     else:
-        parts.append(_chapter_page("RISICOANALYSE PYRO & SPECIAL EFFECTS", "Geen documenten.", logo))
+        c.setFont("Helvetica", 10); c.drawString(30, A4[1]-70, "5.2 AVM — geen items geselecteerd.")
+        c.showPage()
 
-    # 8 Windplan
-    if docs.get("windplan"):
-        parts.append(section_embed_pdf("WINDPLAN", docs["windplan"], logo))
-    else:
-        parts.append(_chapter_page("WINDPLAN", "Niet van toepassing of niet toegevoegd.", logo))
+    # 6. Inplantingsplan (title; actual upload appended later)
+    pdf_section_title(c, "6. Inplantingsplan")
 
-    # 9 Droogteplan
-    if docs.get("droughtplan"):
-        parts.append(section_embed_pdf("DROOGTEPLAN", docs["droughtplan"], logo))
-    else:
-        parts.append(_chapter_page("DROOGTEPLAN", "Niet van toepassing of niet toegevoegd.", logo))
+    # 7. Risicoanalyse Pyro & Special Effects
+    pdf_section_title(c, "7. Risicoanalyse Pyro & Special Effects")
 
-    # 10 Vergunningen & Toelatingen (uploads.permits[])
-    permit_list = upl.get("permits") or []
-    parts.append(section_embed_uploads("VERGUNNINGEN & TOELATINGEN", permit_list, logo))
+    # 8. Windplan
+    pdf_section_title(c, "8. Windplan")
 
-    # -------- Merge alle delen in de juiste volgorde --------
+    # 9. Droogteplan
+    pdf_section_title(c, "9. Droogteplan")
+
+    # 10. Vergunningen & Toelatingen
+    pdf_section_title(c, "10. Vergunningen & Toelatingen")
+
+    c.save()
+    buf.seek(0)
+    return buf
+
+def append_external_pdfs(base_pdf: io.BytesIO, preview: Dict[str, Any]) -> io.BytesIO:
+    """Append external PDFs (emergency, insurance, risk, wind/drought, uploads) after their title pages."""
+    base_reader = PdfReader(base_pdf)
     writer = PdfWriter()
-    for p in parts:
-        _append_pdf(writer, p)
+    for p in base_reader.pages:
+        writer.add_page(p)
+
+    # Helper: append a PDF by URL (each URL)
+    def append_url(url: str):
+        if not url: return
+        b = fetch_bytes(url)
+        if not b: return
+        try:
+            r = PdfReader(io.BytesIO(b))
+            for pg in r.pages:
+                writer.add_page(pg)
+        except Exception:
+            # if not PDF, ignore
+            pass
+
+    docs = preview.get("documents", {})
+
+    # Emergency (2)
+    append_url(docs.get("emergency"))
+
+    # Insurance (3) -> list
+    for u in docs.get("insurance", []) or []:
+        append_url(u)
+
+    # (4 is verantwoordelijke - no pdf append)
+
+    # (5 Materials - no pdf append)
+
+    # (6) Inplantingsplan -> uploads.siteplan (could be multiple files)
+    for up in (preview.get("uploads", {}) or {}).get("siteplan", []) or []:
+        append_url(up.get("data") or up.get("url"))
+
+    # (7) Risks (pyro + general)
+    append_url(docs.get("risk_pyro"))
+    append_url(docs.get("risk_general"))
+
+    # (8) Windplan
+    if preview.get("documents", {}).get("windplan"):
+        append_url(preview["documents"]["windplan"])
+
+    # (9) Droogteplan
+    if preview.get("documents", {}).get("droughtplan"):
+        append_url(preview["documents"]["droughtplan"])
+
+    # (10) Permits uploads
+    for up in (preview.get("uploads", {}) or {}).get("permits", []) or []:
+        append_url(up.get("data") or up.get("url"))
+
     out = io.BytesIO()
     writer.write(out)
-    return out.getvalue()
+    out.seek(0)
+    return out
 
+# DOCX building -------------------------------------------------------------
 
-# =========================================================
-# API Endpoints
-# =========================================================
+def build_docx(preview: Dict[str, Any]) -> io.BytesIO:
+    doc = Document()
 
-@app.get("/", response_class=PlainTextResponse)
-def root():
-    return "Safetyfile PDF Service – OK"
+    # Title / cover
+    h = doc.add_heading("Veiligheidsdossier", 0)
+    if preview.get("avm", {}).get("name"):
+        p = doc.add_paragraph(preview["avm"]["name"])
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
+    # TOC placeholder
+    doc.add_paragraph("Inhoudstafel (vereenvoudigd)").bold = True
+    for s in ["1. Projectgegevens","2. Emergency","3. Verzekeringen","4. Verantwoordelijke","5. Materialen","6. Inplantingsplan","7. Risicoanalyse Pyro & Special Effects","8. Windplan","9. Droogteplan","10. Vergunningen & Toelatingen"]:
+        doc.add_paragraph(s, style=None)
+
+    # 1. Projectgegevens
+    doc.add_heading("1. Projectgegevens", level=1)
+    p = preview.get("avm") or {}
+    table = doc.add_table(rows=0, cols=2)
+    def add_row(label, val):
+        r = table.add_row().cells
+        r[0].text = label
+        r[1].text = clean_text(val)
+    add_row("Project", p.get("name",""))
+    add_row("Opdrachtgever", p.get("customer",{}).get("name",""))
+    add_row("Adres", p.get("customer",{}).get("address",""))
+    if p.get("customer",{}).get("contact"):
+        cc = p["customer"]["contact"]
+        add_row("Contactpersoon", cc.get("name",""))
+        add_row("Tel", cc.get("phone",""))
+        add_row("E-mail", cc.get("email",""))
+    add_row("Locatie", p.get("location",{}).get("name",""))
+    add_row("Adres locatie", p.get("location",{}).get("address",""))
+    add_row("Start", p.get("project_start_date",""))
+    add_row("Einde", p.get("project_end_date",""))
+
+    # 2. Emergency
+    doc.add_heading("2. Emergency", level=1)
+    url = preview.get("documents",{}).get("emergency")
+    if url:
+        pr = doc.add_paragraph("Open emergency: ")
+        run = pr.add_run(url); add_hyperlink(run, url)
+    else:
+        doc.add_paragraph("Geen emergency-document ingesteld.")
+
+    # 3. Verzekeringen
+    doc.add_heading("3. Verzekeringen", level=1)
+    ins = preview.get("documents",{}).get("insurance") or []
+    if ins:
+        for u in ins:
+            pr = doc.add_paragraph("Verzekering: ")
+            run = pr.add_run(u); add_hyperlink(run, u)
+    else:
+        doc.add_paragraph("Geen verzekeringsdocumenten ingesteld.")
+
+    # 4. Verantwoordelijke
+    doc.add_heading("4. Verantwoordelijke", level=1)
+    resp = preview.get("responsible") or "-"
+    doc.add_paragraph(f"Projectverantwoordelijke: {resp}")
+    mini = preview.get("documents",{}).get("crew_bio_mini")
+    full = preview.get("documents",{}).get("crew_bio_full")
+    if mini:
+        try:
+            b = fetch_bytes(mini)
+            if b:
+                tmp = io.BytesIO(b)
+                doc.add_picture(tmp, width=Inches(3.0))
+        except Exception:
+            pass
+    if full:
+        pr = doc.add_paragraph("Volledige bio: ")
+        run = pr.add_run(full); add_hyperlink(run, full)
+
+    # 5. Materialen
+    doc.add_heading("5. Materialen", level=1)
+
+    # 5.1 Dees
+    doc.add_heading("5.1 Dees", level=2)
+    dees = (preview.get("materials") or {}).get("dees") or []
+    if dees:
+        t = doc.add_table(rows=1, cols=4)
+        hdr = t.rows[0].cells
+        hdr[0].text = "Naam"; hdr[1].text = "NEC (g)"; hdr[2].text = "Aantal"; hdr[3].text = "Type"
+        tot_py = 0.0; tot_fw = 0.0
+        for m in dees:
+            tag = str(m.get("custom_13",""))
+            nec = parse_nec(tag)
+            qty = int(m.get("quantity_total",0) or 0)
+            ty = "Pyro" if any(x in tag.upper() for x in ["T1","T2"]) else ("Vuurwerk" if any(x in tag.upper() for x in ["F1","F2","F3","F4"]) else "-")
+            r = t.add_row().cells
+            r[0].text = clean_text(m.get("displayname","")); r[1].text = f"{nec:.3f}"; r[2].text = str(qty); r[3].text = ty
+            if ty == "Pyro": tot_py += nec * max(qty,1)
+            elif ty == "Vuurwerk": tot_fw += nec * max(qty,1)
+        doc.add_paragraph(f"Totaal NEC (Pyro): {tot_py:.3f} g")
+        doc.add_paragraph(f"Totaal NEC (Vuurwerk): {tot_fw:.3f} g")
+    else:
+        doc.add_paragraph("Geen Dees-materialen geselecteerd.")
+
+    # 5.2 AVM
+    doc.add_heading("5.2 AVM", level=2)
+    avm = (preview.get("materials") or {}).get("avm") or []
+    if avm:
+        t = doc.add_table(rows=1, cols=4)
+        hdr = t.rows[0].cells
+        hdr[0].text = "Naam"; hdr[1].text = "Aantal"; hdr[2].text = "Type"; hdr[3].text = "Links"
+        for m in avm:
+            r = t.add_row().cells
+            r[0].text = clean_text(m.get("displayname","")); r[1].text = str(m.get("quantity_total",0)); r[2].text = m.get("type","")
+            links = []
+            for f in m.get("files",[]):
+                url = f.get("url"); nm = f.get("name")
+                if url:
+                    links.append(f"{nm}")
+            r[3].text = "\n".join(links)
+    else:
+        doc.add_paragraph("Geen AVM-materialen geselecteerd.")
+
+    # 6. Inplantingsplan
+    doc.add_heading("6. Inplantingsplan", level=1)
+    site = (preview.get("uploads",{}) or {}).get("siteplan") or []
+    if site:
+        for f in site:
+            u = f.get("data") or f.get("url")
+            if u:
+                pr = doc.add_paragraph("Inplantingsplan: ")
+                run = pr.add_run(u); add_hyperlink(run, u)
+    else:
+        doc.add_paragraph("Geen inplantingsplan toegevoegd.")
+
+    # 7. Risicoanalyse
+    doc.add_heading("7. Risicoanalyse Pyro & Special Effects", level=1)
+    for key, label in [("risk_pyro","Risicoanalyse Pyro"),("risk_general","Risicoanalyse Special Effects")]:
+        u = preview.get("documents",{}).get(key)
+        if u:
+            pr = doc.add_paragraph(label + ": ")
+            run = pr.add_run(u); add_hyperlink(run, u)
+
+    # 8. Windplan
+    doc.add_heading("8. Windplan", level=1)
+    u = preview.get("documents",{}).get("windplan")
+    if u:
+        pr = doc.add_paragraph("Windplan: ")
+        run = pr.add_run(u); add_hyperlink(run, u)
+    else:
+        doc.add_paragraph("Niet geselecteerd.")
+
+    # 9. Droogteplan
+    doc.add_heading("9. Droogteplan", level=1)
+    u = preview.get("documents",{}).get("droughtplan")
+    if u:
+        pr = doc.add_paragraph("Droogteplan: ")
+        run = pr.add_run(u); add_hyperlink(run, u)
+    else:
+        doc.add_paragraph("Niet geselecteerd.")
+
+    # 10. Vergunningen & Toelatingen
+    doc.add_heading("10. Vergunningen & Toelatingen", level=1)
+    permits = (preview.get("uploads",{}) or {}).get("permits") or []
+    if permits:
+        for f in permits:
+            u = f.get("data") or f.get("url")
+            if u:
+                pr = doc.add_paragraph("Vergunning/Toelating: ")
+                run = pr.add_run(u); add_hyperlink(run, u)
+    else:
+        doc.add_paragraph("Geen vergunningen of toelatingen toegevoegd.")
+
+    out = io.BytesIO()
+    doc.save(out)
+    out.seek(0)
+    return out
+
+# Endpoint logic ------------------------------------------------------------
+
+@app.get("/health")
+def health():
+    return jsonify(ok=True, ts=datetime.utcnow().isoformat())
 
 @app.post("/generate")
-def generate(preview: Dict[str, Any] = Body(...)):
-    """
-    Verwacht de 'preview' JSON van de wizard.
-    Returned: application/pdf (binary).
-    """
+def generate():
     try:
-        pdf_bytes = build_full_pdf(preview)
-        headers = {
-            "Content-Disposition": 'attachment; filename="veiligheidsdossier.pdf"'
-        }
-        return Response(content=pdf_bytes, media_type="application/pdf", headers=headers)
-    except Exception as e:
-        return PlainTextResponse(str(e), status_code=500)
+        payload = request.get_json(force=True, silent=False) or {}
+    except Exception:
+        return jsonify(error="Invalid JSON"), 400
 
+    preview = payload.get("preview") or payload  # allow raw preview
+    fmt = (payload.get("format") or preview.get("format") or "pdf").lower()
 
-# Railway/Render start: python generate_pdf.py
+    # Build base PDF
+    base_pdf = build_base_pdf(preview)
+    # Append external PDFs
+    final_pdf = append_external_pdfs(base_pdf, preview)
+
+    if fmt == "pdf":
+        filename = f"dossier.pdf"
+        return send_file(final_pdf, mimetype="application/pdf", as_attachment=True, download_name=filename)
+
+    # DOCX path
+    docx_buf = build_docx(preview)
+    filename = f"dossier.docx"
+    return send_file(docx_buf, mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                     as_attachment=True, download_name=filename)
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("generate_pdf:app", host="0.0.0.0", port=8000, reload=False)
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)

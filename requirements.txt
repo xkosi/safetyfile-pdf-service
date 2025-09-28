@@ -5,3 +5,4 @@ pypdf
 pillow
 requests
 python-docx
+flask

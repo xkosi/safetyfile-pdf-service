@@ -9,3 +9,5 @@ flask==2.3.3
 gunicorn
 python-docx
 openpyxl
+PyPDF2
+PyMuPDF

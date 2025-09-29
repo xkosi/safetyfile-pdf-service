@@ -210,20 +210,16 @@ def merge_pdf_firstpage_under_header(base_pdf_bytes, external_pdf_bytes, header_
     tx = left
     ty = bottom
     t = Transformation().scale(scale).translate(tx/scale, ty/scale)
+t = Transformation().scale(scale).translate(tx/scale, ty/scale)
+
 # Compatibiliteit PyPDF2 2.x / 3.x
-if hasattr(page, "merge_transformed_page"):
-  # Compatibiliteit voor PyPDF2 versies
 if hasattr(page, "merge_transformed_page"):
     page.merge_transformed_page(src_page, t)  # nieuwe naam (PyPDF2 >= 3.0)
 elif hasattr(page, "mergeTransformedPage"):
     page.mergeTransformedPage(src_page, t)    # oude naam (PyPDF2 <= 2.x)
 else:
     raise AttributeError("Geen geldige merge-methode gevonden in PyPDF2")
-  # nieuwe naam (sinds PyPDF2 >= 3.0)
-elif hasattr(page, "mergeTransformedPage"):
-    page.mergeTransformedPage(src_page, t)    # oude naam
-else:
-    raise AttributeError("Geen geldige merge-functie in PyPDF2 gevonden")
+
 
 
     # Append the rest pages of base (if any beyond page 1)

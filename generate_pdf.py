@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Improved generator for Veiligheidsdossier (PDF & DOCX).
-Fixes:
- - Projectgegevens and Responsible populated correctly
- - Responsible bio PDFs inserted if available
- - TOC numbering corrected (no duplicates)
- - External PDFs inserted under section titles
+Finalized generator for Veiligheidsdossier (PDF & DOCX).
+Adds:
+ - Projectgegevens populated from preview.avm
+ - Responsible populated from preview.responsible
+ - Crew bio PDFs inserted under responsible
+ - External PDFs (emergency, insurance, wind, drought, permits, siteplan, risks) merged under sections
 """
 
 import io, base64, datetime, re, requests
@@ -164,11 +164,72 @@ def build_base_pdf(preview):
         elif s["key"]=="materials": fr.addFromList(story_materials(preview),c)
     c.save(); return buf.getvalue(),sections
 
-# DOCX builder simplified
+# Merge externals
+def find_section_pages(reader):
+    mapping={}
+    for idx,pg in enumerate(reader.pages):
+        try: text=pg.extract_text() or ""
+        except: text=""
+        for key in re.findall(r"\[SEC::([^\]]+)\]",text):
+            mapping[key]=idx
+    return mapping
+
+def scale_merge_first_page_under_banner(writer,page_index,ext_reader):
+    if not ext_reader or len(ext_reader.pages)==0: return
+    dst=writer.pages[page_index]; src=ext_reader.pages[0]
+    avail_w=W-(MARGIN_L+MARGIN_R); avail_h=CONTENT_TOP_Y-MARGIN_B
+    fw=float(src.mediabox.width); fh=float(src.mediabox.height)
+    s=min(avail_w/fw,avail_h/fh,1.0)
+    tx=MARGIN_L; ty=MARGIN_B
+    op=Transformation().scale(s).translate(tx/s,ty/s)
+    dst.merge_transformed_page(src,op)
+    for i in range(1,len(ext_reader.pages)): writer.add_page(ext_reader.pages[i])
+
+def collect_pdf_lists(preview):
+    docs=(preview or {}).get("documents") or {}; uploads=(preview or {}).get("uploads") or {}
+    def list_from(v): return v if isinstance(v,list) else ([v] if v else [])
+    data={}
+    data["emergency"]=[_fetch_pdf_bytes(u) for u in list_from(docs.get("emergency")) if u]
+    data["insurance"]=[_fetch_pdf_bytes(u) for u in list_from(docs.get("insurance")) if u]
+    data["wind"]=[_fetch_pdf_bytes(docs.get("windplan"))] if docs.get("windplan") else []
+    data["drought"]=[_fetch_pdf_bytes(docs.get("droughtplan"))] if docs.get("droughtplan") else []
+    bios=[]
+    for k in ("crew_bio_full","crew_bio_mini"):
+        u=docs.get(k); b=_fetch_pdf_bytes(u)
+        if b: bios.append(b)
+    data["responsible_bio"]=bios
+    for rk,dk in (("risk_pyro","risk_pyro"),("risk_sfx","risk_general")):
+        u=docs.get(dk); b=_fetch_pdf_bytes(u)
+        data[rk]=[b] if b else []
+    data["siteplan"]=[_dataurl_to_bytes(f.get("data")) for f in uploads.get("siteplan",[]) if f.get("data")]
+    data["permits"]=[_dataurl_to_bytes(f.get("data")) for f in uploads.get("permits",[]) if f.get("data")]
+    return data
+
+def merge_externals(base_bytes,sections,preview):
+    reader=PdfReader(io.BytesIO(base_bytes)); writer=PdfWriter()
+    for p in reader.pages: writer.add_page(p)
+    page_map=find_section_pages(reader); blobs=collect_pdf_lists(preview)
+    plan={"emergency":blobs.get("emergency",[]),"insurance":blobs.get("insurance",[]),
+          "responsible":blobs.get("responsible_bio",[]),"siteplan":blobs.get("siteplan",[]),
+          "risk_pyro":blobs.get("risk_pyro",[]),"risk_sfx":blobs.get("risk_sfx",[]),
+          "wind":blobs.get("wind",[]),"drought":blobs.get("drought",[]),
+          "permits":blobs.get("permits",[])}
+    sortable=[(k,page_map[k]) for k in plan.keys() if k in page_map and plan[k]]
+    sortable.sort(key=lambda x:x[1],reverse=True)
+    for key,page_index in sortable:
+        items=plan[key]; first=True
+        for b in items:
+            try: ext=PdfReader(io.BytesIO(b))
+            except: continue
+            if first: scale_merge_first_page_under_banner(writer,page_index,ext); first=False
+            else:
+                for p in ext.pages: writer.add_page(p)
+    out=io.BytesIO(); writer.write(out); return out.getvalue()
+
+# DOCX simplified
 def build_docx(preview):
     if not DOCX_AVAILABLE: raise RuntimeError("python-docx not installed")
-    doc=Document()
-    avm=(preview or {}).get("avm") or {}
+    doc=Document(); avm=(preview or {}).get("avm") or {}
     pname=avm.get("name") or (preview or {}).get("project",{}).get("name") or "Veiligheidsdossier"
     doc.add_heading("Veiligheidsdossier",0); doc.add_paragraph(pname)
     tbl=doc.add_table(rows=0,cols=2)
@@ -189,7 +250,8 @@ def generate():
         except Exception as e: return jsonify({"error":"DOCX generation failed","detail":str(e)}),500
     try:
         base_bytes,sections=build_base_pdf(preview)
-        return send_file(io.BytesIO(base_bytes),mimetype="application/pdf",
+        final_bytes=merge_externals(base_bytes,sections,preview)
+        return send_file(io.BytesIO(final_bytes),mimetype="application/pdf",
             as_attachment=True,download_name="dossier.pdf")
     except Exception as e:
         return jsonify({"error":"PDF generation failed","detail":str(e)}),500

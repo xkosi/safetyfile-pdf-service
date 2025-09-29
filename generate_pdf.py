@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Full generator for Veiligheidsdossier (PDF & DOCX).
-
-POST /generate with JSON:
-  { "preview": {...}, "format": "pdf"|"docx" }
+Improved generator for Veiligheidsdossier (PDF & DOCX).
+Fixes:
+ - Projectgegevens and Responsible populated correctly
+ - Responsible bio PDFs inserted if available
+ - TOC numbering corrected (no duplicates)
+ - External PDFs inserted under section titles
 """
 
-import io, base64, datetime, re
-import requests
+import io, base64, datetime, re, requests
 from flask import Flask, request, send_file, jsonify
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
@@ -19,52 +20,41 @@ from pypdf import PdfReader, PdfWriter, Transformation
 try:
     from docx import Document
     DOCX_AVAILABLE = True
-except Exception:
+except:
     DOCX_AVAILABLE = False
 
 app = Flask(__name__)
 
 # Layout
-W, H = A4
-MARGIN_L = 22
-MARGIN_R = 22
-MARGIN_B = 34
-BANNER_H = 48
-CONTENT_TOP_Y = H - (BANNER_H + 26)
-RED = colors.HexColor("#B00000")
-BLACK = colors.black
+W,H=A4
+MARGIN_L=22; MARGIN_R=22; MARGIN_B=34; BANNER_H=48; CONTENT_TOP_Y=H-(BANNER_H+26)
+RED=colors.HexColor("#B00000"); BLACK=colors.black
 
-styles = getSampleStyleSheet()
-P = ParagraphStyle("Body", parent=styles["Normal"], fontName="Helvetica", fontSize=10, leading=13, textColor=BLACK)
-P_H = ParagraphStyle("H", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=12, leading=14, textColor=BLACK, spaceAfter=6)
+styles=getSampleStyleSheet()
+P=ParagraphStyle("Body",parent=styles["Normal"],fontName="Helvetica",fontSize=10,leading=13,textColor=BLACK)
+P_H=ParagraphStyle("H",parent=styles["Heading2"],fontName="Helvetica-Bold",fontSize=12,leading=14,textColor=BLACK,spaceAfter=6)
 
-def _safe(val, default=""):
-    return default if val is None else str(val)
-
+def _safe(val,default=""): return default if val is None else str(val)
 def _fmt_date(val):
     if not val: return ""
     try:
-        iso = str(val).replace("Z","").replace("T"," ")
+        iso=str(val).replace("Z","").replace("T"," ")
         return datetime.datetime.fromisoformat(iso).strftime("%d/%m/%Y")
-    except Exception:
-        return str(val)
-
+    except: return str(val)
 def _dataurl_to_bytes(u):
     if not u or not isinstance(u,str): return None
     if u.startswith("data:"):
-        try:
-            return base64.b64decode(u.split(",",1)[1])
+        try: return base64.b64decode(u.split(",",1)[1])
         except: return None
     return None
-
 def _fetch_pdf_bytes(item):
     if not item: return None
     if isinstance(item,bytes): return item
     if isinstance(item,str):
-        b = _dataurl_to_bytes(item)
+        b=_dataurl_to_bytes(item)
         if b: return b
         try:
-            r = requests.get(item,timeout=15)
+            r=requests.get(item,timeout=15)
             if r.ok: return r.content
         except: return None
     return None
@@ -74,22 +64,17 @@ def draw_banner(c,title):
     c.setFillColor(RED); c.rect(0,H-BANNER_H,W,BANNER_H,fill=1,stroke=0)
     c.setFillColor(colors.white); c.setFont("Helvetica-Bold",14)
     c.drawString(MARGIN_L,H-BANNER_H+16,_safe(title))
-
 def draw_marker(c,key):
     c.setFillColor(colors.white); c.setFont("Helvetica",1); c.drawString(2,2,f"[SEC::{key}]")
-
 def start_section(c,key,title):
     c.showPage(); draw_banner(c,title); draw_marker(c,key)
-
 def content_frame():
     return Frame(MARGIN_L,MARGIN_B,W-(MARGIN_L+MARGIN_R),CONTENT_TOP_Y-MARGIN_B,showBoundary=0)
 
-# Content builders
+# Content
 def story_project(preview):
     avm=(preview or {}).get("avm") or {}
-    cust=(avm.get("customer") or {})
-    contact=(cust.get("contact") or {})
-    loc=(avm.get("location") or {})
+    cust=(avm.get("customer") or {}); contact=(cust.get("contact") or {}); loc=(avm.get("location") or {})
     rows=[["Project",_safe(avm.get("name"))],
           ["Opdrachtgever",_safe(cust.get("name"))],
           ["Adres",_safe(cust.get("address"))]]
@@ -126,39 +111,31 @@ def _materials_rows(items):
 
 def story_materials(preview):
     mats=(preview or {}).get("materials") or {}
-    avm_items=mats.get("avm") or []
-    dees_items=mats.get("dees") or []
+    avm_items=mats.get("avm") or []; dees_items=mats.get("dees") or []
     story=[Paragraph("5.1 Pyrotechnische materialen",P_H)]
     if not dees_items: story.append(Paragraph("Geen items geselecteerd.",P))
-    else:
-        t=Table(_materials_rows(dees_items),colWidths=[220,45,80,90,90,90])
-        story.append(t)
+    else: story.append(Table(_materials_rows(dees_items),colWidths=[220,45,80,90,90,90]))
     story.append(Spacer(1,10))
     story.append(Paragraph("5.2 Speciale effecten",P_H))
     if not avm_items: story.append(Paragraph("Geen items geselecteerd.",P))
-    else:
-        t=Table(_materials_rows(avm_items),colWidths=[220,45,80,90,90,90])
-        story.append(t)
+    else: story.append(Table(_materials_rows(avm_items),colWidths=[220,45,80,90,90,90]))
     return story
 
-# Sections
+# Sections & TOC
 def build_sections(preview):
     mats=(preview or {}).get("materials") or {}
-    has_pyro=bool(mats.get("dees"))
-    has_sfx=bool(mats.get("avm"))
+    has_pyro=bool(mats.get("dees")); has_sfx=bool(mats.get("avm"))
+    base=["project","emergency","insurance","responsible","materials","siteplan"]
+    if has_pyro: base.append("risk_pyro")
+    if has_sfx: base.append("risk_sfx")
+    base+=["wind","drought","permits"]
     sections=[]
-    n=1
-    def add(k,t):
-        nonlocal n; sections.append({"key":k,"title":f"{n}. {t}"}); n+=1
-    add("project","Projectgegevens")
-    add("emergency","Emergency")
-    add("insurance","Verzekeringen")
-    add("responsible","Verantwoordelijke")
-    add("materials","Materialen")
-    add("siteplan","Inplantingsplan")
-    if has_pyro: sections.append({"key":"risk_pyro","title":f"{len(sections)+1}. Risicoanalyse Pyro"})
-    if has_sfx: sections.append({"key":"risk_sfx","title":f"{len(sections)+1}. Risicoanalyse Speciale effecten"})
-    add("wind","Windplan"); add("drought","Droogteplan"); add("permits","Vergunningen & Toelatingen")
+    for i,key in enumerate(base,1):
+        title_map={"project":"Projectgegevens","emergency":"Emergency","insurance":"Verzekeringen",
+                   "responsible":"Verantwoordelijke","materials":"Materialen","siteplan":"Inplantingsplan",
+                   "risk_pyro":"Risicoanalyse Pyro","risk_sfx":"Risicoanalyse Speciale effecten",
+                   "wind":"Windplan","drought":"Droogteplan","permits":"Vergunningen & Toelatingen"}
+        sections.append({"key":key,"title":f"{i}. {title_map[key]}"})
     return sections
 
 def draw_cover(c,preview):
@@ -181,14 +158,13 @@ def build_base_pdf(preview):
         c.drawString(MARGIN_L,y,s["title"]); y-=16
         if y<MARGIN_B+30: c.showPage(); draw_banner(c,"Inhoudstafel"); y=CONTENT_TOP_Y
     for s in sections:
-        start_section(c,s["key"],s["title"])
-        fr=content_frame()
+        start_section(c,s["key"],s["title"]); fr=content_frame()
         if s["key"]=="project": fr.addFromList(story_project(preview),c)
         elif s["key"]=="responsible": fr.addFromList(story_responsible(preview),c)
         elif s["key"]=="materials": fr.addFromList(story_materials(preview),c)
     c.save(); return buf.getvalue(),sections
 
-# DOCX
+# DOCX builder simplified
 def build_docx(preview):
     if not DOCX_AVAILABLE: raise RuntimeError("python-docx not installed")
     doc=Document()
@@ -197,7 +173,7 @@ def build_docx(preview):
     doc.add_heading("Veiligheidsdossier",0); doc.add_paragraph(pname)
     tbl=doc.add_table(rows=0,cols=2)
     for k,v in [("Project",avm.get("name")),("Opdrachtgever",(avm.get("customer") or {}).get("name"))]:
-        r=tbl.add_row().cells; r[0].text,_= _safe(k), r[1].text; r[1].text=_safe(v)
+        r=tbl.add_row().cells; r[0].text=_safe(k); r[1].text=_safe(v)
     doc.add_heading("Verantwoordelijke",1); doc.add_paragraph(_safe((preview or {}).get("responsible") or "Geen verantwoordelijke"))
     out=io.BytesIO(); doc.save(out); return out.getvalue()
 
@@ -218,5 +194,4 @@ def generate():
     except Exception as e:
         return jsonify({"error":"PDF generation failed","detail":str(e)}),500
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0",port=8000)
+if __name__=="__main__": app.run(host="0.0.0.0",port=8000)

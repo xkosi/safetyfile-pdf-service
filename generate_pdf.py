@@ -228,10 +228,28 @@ def merge_externals(base_bytes,sections,preview):
 
 # DOCX simplified
 
+
+
 from docxtpl import DocxTemplate
 
 def build_docx(preview):
-    import requests, io
+    import requests, io, datetime
+
+    def _safe(x, default=""):
+        return default if x is None else str(x)
+
+    def _fmt_date(s):
+        if not s: return ""
+        try:
+            iso = str(s).replace("Z","+00:00").replace("T"," ")
+            return datetime.datetime.fromisoformat(iso).strftime("%d/%m/%Y")
+        except Exception:
+            try:
+                return datetime.datetime.strptime(str(s)[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+            except Exception:
+                return str(s)
+
+    # kies taal uit preview (fallback nl)
     lang = (preview.get("language") or "nl").lower()
     url = f"https://sfx.rentals/safetyfile/templates/dossier_{lang}.docx"
     try:
@@ -239,15 +257,98 @@ def build_docx(preview):
         r.raise_for_status()
     except Exception as e:
         raise Exception(f"Kon template niet ophalen: {e}")
+
     tpl = DocxTemplate(io.BytesIO(r.content))
-    ctx = preview or {}
+
+    # Mapping context volgens variables.md
+    avm = preview.get("avm", {}) or preview.get("project", {}) or {}
+    cust = avm.get("customer", {}) or {}
+    contact = cust.get("contact", {}) or {}
+    loc = avm.get("location", {}) or {}
+    resp = preview.get("responsible", {}) or {}
+
+    # Zet materiaal tabellen om naar lijsten van dicts
+    dees_items = (preview.get("materials") or {}).get("dees") or []
+    avm_items = (preview.get("materials") or {}).get("avm") or []
+
+    pyro_table = []
+    for it in dees_items:
+        pyro_table.append({
+            "qty": _safe(it.get("quantity_total")),
+            "description": _safe(it.get("displayname")),
+            "code": _safe(it.get("code")),
+            "type": _safe(it.get("type")),
+            "ce": "JA" if (it.get("links") or {}).get("ce") else "",
+            "manual": "JA" if (it.get("links") or {}).get("manual") else "",
+            "msds": "JA" if (it.get("links") or {}).get("msds") else "",
+        })
+
+    effects_table = []
+    for it in avm_items:
+        effects_table.append({
+            "qty": _safe(it.get("quantity_total")),
+            "description": _safe(it.get("displayname")),
+            "code": _safe(it.get("code")),
+            "type": _safe(it.get("type")),
+            "ce": "JA" if (it.get("links") or {}).get("ce") else "",
+            "manual": "JA" if (it.get("links") or {}).get("manual") else "",
+            "msds": "JA" if (it.get("links") or {}).get("msds") else "",
+        })
+
+    ctx = {
+        "event_name": _safe(avm.get("name")),
+        "event_date": _fmt_date(avm.get("start_date") or avm.get("project_start_date")),
+        "event_date_long": _fmt_date(avm.get("start_date") or avm.get("project_start_date")),
+        "event_times": f"{_fmt_date(avm.get('start_date'))} - {_fmt_date(avm.get('end_date'))}",
+        "build_up_date": _fmt_date(avm.get("project_start_date")),
+        "prepared_on": datetime.datetime.now().strftime("%d/%m/%Y"),
+
+        "supplier_name": "AVM Belgium bv",
+        "supplier_address_line1": "Schaapschuur 1/14",
+        "supplier_address_line2": "1790 Affligem",
+        "supplier_address_country": "België",
+        "supplier_phone": "+32 53 438343",
+        "supplier_mail": "info@avm-sfx.com",
+
+        "lead_1_name": _safe(resp.get("name")),
+        "lead_1_title": _safe(resp.get("title")),
+        "lead_1_phone": _safe(resp.get("phone")),
+        "lead_1_mail": _safe(resp.get("email")),
+        "lead_1_bio_short": _safe(resp.get("bio")),
+        "lead_1_photo": resp.get("photo"),
+        "lead_1_bio_url": resp.get("bio_url"),
+
+        "customer_name": _safe(cust.get("name")),
+        "customer_address_line1": _safe(cust.get("address")),
+        "customer_address_line2": "",
+        "customer_contact_name": _safe(contact.get("name")),
+        "customer_contact_mail": _safe(contact.get("email")),
+
+        "emergency_ambulance": "112",
+        "emergency_fire": "112",
+        "emergency_police": "101",
+        "emergency_doctor": "1733",
+        "emergency_poisoncenter": "070 245 245",
+        "burncenter_antwerp": "03 217 75 95",
+        "burncenter_gent": "09 332 34 90",
+        "burncenter_leuven": "016 34 87 50",
+        "burncenter_charleroi": "071 10 60 00",
+        "burncenter_brussels": "02 268 62 00",
+
+        "pyro_table": pyro_table,
+        "effects_table": effects_table,
+    }
+
     try:
         tpl.render(ctx)
     except Exception as e:
         raise Exception(f"Fout bij vullen template: {e}")
+
     out = io.BytesIO()
     tpl.save(out)
     return out.getvalue()
+
+
 
 
 @app.route("/generate",methods=["POST"])
